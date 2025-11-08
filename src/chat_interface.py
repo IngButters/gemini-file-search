@@ -2,10 +2,13 @@
 
 from pathlib import Path
 from datetime import datetime
+from typing import List, Optional
+import hashlib
 
 from src.config import Config
 from src.gemini_client import GeminiChatClient
 from src.file_search_manager import FileSearchManager
+from src.table_comparison import ComparisonResult, TableComparisonOrchestrator
 
 
 class ChatInterface:
@@ -33,6 +36,12 @@ class ChatInterface:
 
         self.current_store = None
         self.is_running = False
+        self.last_comparison_result: Optional[ComparisonResult] = None
+        self.comparison_orchestrator = TableComparisonOrchestrator(
+            embed_fn=self._embed_texts,
+            unit_column="unit",
+            currency_column="currency",
+        )
 
     def start(self):
         """Start the chat interface."""
@@ -109,6 +118,12 @@ class ChatInterface:
             self.cmd_show_history()
         elif cmd == '/export' or cmd == '/export-chat':
             self.cmd_export_chat(args)
+        elif cmd == '/compare':
+            self.cmd_compare(args)
+        elif cmd == '/compare-summary':
+            self.cmd_compare_summary()
+        elif cmd == '/compare-export':
+            self.cmd_compare_export(args)
         else:
             print(f"Unknown command: {cmd}")
             print("Type '/help' for available commands")
@@ -133,6 +148,117 @@ class ChatInterface:
         if response:
             self.gemini_client.display_response(response)
 
+    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Generate lightweight embeddings deterministically.
+
+        This fallback implementation hashes text into a fixed length vector so
+        that matching logic can be exercised in offline environments. In
+        production this method can be replaced with a call to a true embedding
+        service such as Gemini or Vertex AI.
+        """
+
+        vectors: List[List[float]] = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            vector = []
+            for idx in range(0, 32, 4):
+                chunk = digest[idx : idx + 4]
+                value = int.from_bytes(chunk, "big") / 0xFFFFFFFF
+                vector.append(value)
+            vectors.append(vector)
+        return vectors
+
+    def display_comparison_summary(self, result: Optional[ComparisonResult] = None):
+        """Print a concise summary of comparison results."""
+
+        result = result or self.last_comparison_result
+        if not result or not result.reports:
+            print("\nNo comparison results available.")
+            return
+
+        print("\n" + "=" * 70)
+        print("TABLE COMPARISON SUMMARY")
+        print("=" * 70)
+        for report in result.reports:
+            print(f"\nBase: {report.base_file.name}")
+            print(f"Peer: {report.peer_file.name}")
+            print(f"  Matches: {len(report.matches)}")
+            print(f"  Unmatched base rows: {len(report.unmatched_base)}")
+            print(f"  Unmatched peer rows: {len(report.unmatched_peer)}")
+        print("=" * 70)
+
+    def cmd_compare(self, args: str):
+        """Run table comparisons using the orchestrator."""
+
+        parts = args.split()
+        if len(parts) < 2:
+            print("Usage: /compare <base-file> <peer-file> [peer-file...]")
+            return
+
+        base_path = Config.FILES_DIR / parts[0]
+        peer_paths = [Config.FILES_DIR / peer for peer in parts[1:]]
+
+        missing = [path for path in [base_path, *peer_paths] if not path.exists()]
+        if missing:
+            print("Missing files:")
+            for path in missing:
+                print(f"  - {path}")
+            return
+
+        try:
+            result = self.comparison_orchestrator.run(base_path, peer_paths)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            print(f"Error running comparison: {exc}")
+            return
+
+        self.last_comparison_result = result
+        self.display_comparison_summary(result)
+
+    def cmd_compare_summary(self):
+        """Display the summary for the most recent comparison."""
+
+        self.display_comparison_summary()
+
+    def cmd_compare_export(self, args: str):
+        """Export the latest comparison to CSV or Markdown."""
+
+        if not self.last_comparison_result:
+            print("\nNo comparison results to export. Run /compare first.")
+            return
+
+        parts = args.split()
+        if not parts:
+            print("Usage: /compare-export <csv|md> [filename]")
+            return
+
+        fmt = parts[0].lower()
+        filename = parts[1] if len(parts) > 1 else None
+
+        if fmt not in {"csv", "md", "markdown"}:
+            print("Format must be 'csv' or 'md'.")
+            return
+
+        if fmt == "csv":
+            content = self.last_comparison_result.to_csv()
+            extension = "csv"
+        else:
+            content = self.last_comparison_result.to_markdown()
+            extension = "md"
+
+        if not content:
+            print("No match data available to export.")
+            return
+
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"comparison_{timestamp}.{extension}"
+        elif not filename.endswith(f".{extension}"):
+            filename = f"{filename}.{extension}"
+
+        output_path = Config.FILES_DIR / filename
+        output_path.write_text(content, encoding="utf-8")
+        print(f"\nComparison results exported to {output_path}")
+
     def show_help(self):
         """Display help information."""
         print("\n" + "="*70)
@@ -150,6 +276,10 @@ class ChatInterface:
         print("  /reset                   - Reset the current chat session")
         print("  /history                 - Show chat history")
         print("  /export [filename]       - Export chat history as markdown")
+        print("\nTable Comparison:")
+        print("  /compare <base> <peer...> - Compare base table against peers")
+        print("  /compare-summary         - Show summary of the last comparison")
+        print("  /compare-export <fmt> [filename] - Export last comparison (csv/md)")
         print("\nGeneral:")
         print("  /help                    - Show this help message")
         print("  /quit or /exit           - Exit the application")

@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch, mock_open
 from datetime import datetime
+from types import SimpleNamespace
 from src.chat_interface import ChatInterface
 from src.config import Config
 
@@ -110,6 +111,7 @@ class TestHandleCommand:
 
         captured = capsys.readouterr()
         assert 'AVAILABLE COMMANDS' in captured.out
+        assert 'Table Comparison' in captured.out
 
     @patch('src.chat_interface.Config.validate')
     @patch('src.chat_interface.GeminiChatClient')
@@ -188,6 +190,45 @@ class TestHandleCommand:
         interface.handle_command('/list-stores')
 
         mock_cmd.assert_called_once()
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    @patch.object(ChatInterface, 'cmd_compare')
+    def test_handle_compare_command(self, mock_cmd, mock_fsm, mock_client, mock_validate):
+        """Test handling /compare command dispatch."""
+        mock_validate.return_value = True
+
+        interface = ChatInterface()
+        interface.handle_command('/compare base.xlsx peer.xlsx')
+
+        mock_cmd.assert_called_once_with('base.xlsx peer.xlsx')
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    @patch.object(ChatInterface, 'cmd_compare_summary')
+    def test_handle_compare_summary_command(self, mock_cmd, mock_fsm, mock_client, mock_validate):
+        """Test handling /compare-summary command dispatch."""
+        mock_validate.return_value = True
+
+        interface = ChatInterface()
+        interface.handle_command('/compare-summary')
+
+        mock_cmd.assert_called_once()
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    @patch.object(ChatInterface, 'cmd_compare_export')
+    def test_handle_compare_export_command(self, mock_cmd, mock_fsm, mock_client, mock_validate):
+        """Test handling /compare-export command dispatch."""
+        mock_validate.return_value = True
+
+        interface = ChatInterface()
+        interface.handle_command('/compare-export csv')
+
+        mock_cmd.assert_called_once_with('csv')
 
 
 class TestHandleChatMessage:
@@ -417,6 +458,91 @@ class TestCmdDeleteStore:
 
         assert interface.current_store is None
         mock_client_instance.set_file_search_stores.assert_called_once_with([])
+
+
+class TestComparisonCommands:
+    """Tests for table comparison command helpers."""
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    def test_cmd_compare_runs_orchestrator(self, mock_fsm, mock_client, mock_validate, tmp_path, monkeypatch, capsys):
+        mock_validate.return_value = True
+        base = tmp_path / 'base.xlsx'
+        peer = tmp_path / 'peer.xlsx'
+        base.write_text('base')
+        peer.write_text('peer')
+
+        interface = ChatInterface()
+        monkeypatch.setattr(Config, 'FILES_DIR', tmp_path)
+
+        report = SimpleNamespace(
+            base_file=base,
+            peer_file=peer,
+            matches=[1],
+            unmatched_base=[],
+            unmatched_peer=[],
+        )
+        result = SimpleNamespace(
+            reports=[report],
+            to_csv=lambda: 'a,b',
+            to_markdown=lambda: 'md',
+        )
+        interface.comparison_orchestrator = Mock()
+        interface.comparison_orchestrator.run.return_value = result
+
+        interface.cmd_compare(f'{base.name} {peer.name}')
+
+        captured = capsys.readouterr()
+        assert 'TABLE COMPARISON SUMMARY' in captured.out
+        assert interface.last_comparison_result == result
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    def test_cmd_compare_handles_missing_files(self, mock_fsm, mock_client, mock_validate, tmp_path, monkeypatch, capsys):
+        mock_validate.return_value = True
+        interface = ChatInterface()
+        monkeypatch.setattr(Config, 'FILES_DIR', tmp_path)
+
+        interface.cmd_compare('base.xlsx peer.xlsx')
+        captured = capsys.readouterr()
+        assert 'Missing files' in captured.out
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    def test_cmd_compare_export_csv(self, mock_fsm, mock_client, mock_validate, tmp_path, monkeypatch):
+        mock_validate.return_value = True
+        interface = ChatInterface()
+        monkeypatch.setattr(Config, 'FILES_DIR', tmp_path)
+        report = SimpleNamespace(
+            base_file=tmp_path / 'base.xlsx',
+            peer_file=tmp_path / 'peer.xlsx',
+            matches=[1],
+            unmatched_base=[],
+            unmatched_peer=[],
+        )
+        interface.last_comparison_result = SimpleNamespace(
+            reports=[report],
+            to_csv=lambda: 'col\nval',
+            to_markdown=lambda: 'md',
+        )
+        interface.cmd_compare_export('csv output')
+        output_file = tmp_path / 'output.csv'
+        assert output_file.exists()
+        assert output_file.read_text() == 'col\nval'
+
+    @patch('src.chat_interface.Config.validate')
+    @patch('src.chat_interface.GeminiChatClient')
+    @patch('src.chat_interface.FileSearchManager')
+    def test_cmd_compare_summary_without_results(self, mock_fsm, mock_client, mock_validate, capsys):
+        mock_validate.return_value = True
+        interface = ChatInterface()
+        interface.last_comparison_result = None
+        interface.cmd_compare_summary()
+        captured = capsys.readouterr()
+        assert 'No comparison results available' in captured.out
 
 
 class TestCmdUploadFiles:
