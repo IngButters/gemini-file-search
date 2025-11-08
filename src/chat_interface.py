@@ -6,6 +6,9 @@ from datetime import datetime
 from src.config import Config
 from src.gemini_client import GeminiChatClient
 from src.file_search_manager import FileSearchManager
+from src.table_extractor import TableExtractor
+from src.semantic_matcher import SemanticMatcher
+from src.comparison_generator import ComparisonGenerator
 
 
 class ChatInterface:
@@ -31,8 +34,18 @@ class ChatInterface:
             store_prefix=Config.FILE_SEARCH_STORE_PREFIX
         )
 
+        # Initialize table comparison modules
+        self.table_extractor = TableExtractor(gemini_client=self.gemini_client)
+        self.semantic_matcher = SemanticMatcher(gemini_client=self.gemini_client)
+        self.comparison_generator = ComparisonGenerator()
+
         self.current_store = None
         self.is_running = False
+
+        # Table comparison state
+        self.extracted_tables = {}  # filename -> DataFrame
+        self.base_file = None
+        self.comparison_files = []
 
     def start(self):
         """Start the chat interface."""
@@ -109,6 +122,17 @@ class ChatInterface:
             self.cmd_show_history()
         elif cmd == '/export' or cmd == '/export-chat':
             self.cmd_export_chat(args)
+        # Table comparison commands
+        elif cmd == '/extract' or cmd == '/extract-tables':
+            self.cmd_extract_tables(args)
+        elif cmd == '/preview' or cmd == '/preview-table':
+            self.cmd_preview_table(args)
+        elif cmd == '/set-base':
+            self.cmd_set_base(args)
+        elif cmd == '/compare' or cmd == '/compare-tables':
+            self.cmd_compare_tables(args)
+        elif cmd == '/export-comparison':
+            self.cmd_export_comparison(args)
         else:
             print(f"Unknown command: {cmd}")
             print("Type '/help' for available commands")
@@ -150,6 +174,12 @@ class ChatInterface:
         print("  /reset                   - Reset the current chat session")
         print("  /history                 - Show chat history")
         print("  /export [filename]       - Export chat history as markdown")
+        print("\nTable Comparison Commands:")
+        print("  /extract [file]          - Extract tables from files in 'files' directory")
+        print("  /preview <file>          - Preview extracted table")
+        print("  /set-base <file>         - Set base file for comparison")
+        print("  /compare <files...>      - Compare base with other files")
+        print("  /export-comparison <out> - Export comparison to Excel/CSV")
         print("\nGeneral:")
         print("  /help                    - Show this help message")
         print("  /quit or /exit           - Exit the application")
@@ -425,3 +455,260 @@ class ChatInterface:
             markdown += f"**Grounding supports:** {len(grounding_metadata.grounding_supports)} segment(s) grounded\n\n"
 
         return markdown
+
+    # ========================================================================
+    # Table Comparison Commands
+    # ========================================================================
+
+    def cmd_extract_tables(self, args: str):
+        """Extract tables from files in 'files' directory.
+
+        Args:
+            args: Optional filename to extract from (or empty for all)
+        """
+        print("\n" + "="*60)
+        print("EXTRACTING TABLES")
+        print("="*60)
+
+        # Get files to extract
+        if args.strip():
+            # Extract specific file
+            filepath = Config.FILES_DIR / args.strip()
+            if not filepath.exists():
+                print(f"\nError: File not found: {filepath}")
+                return
+            files_to_extract = [filepath]
+        else:
+            # Extract all supported files
+            files_to_extract = []
+            for ext in ['.pdf', '.xlsx', '.xls', '.csv']:
+                files_to_extract.extend(Config.FILES_DIR.glob(f'*{ext}'))
+
+        if not files_to_extract:
+            print("\nNo supported files found in 'files' directory.")
+            print("Supported formats: PDF, Excel (.xlsx, .xls), CSV")
+            return
+
+        print(f"\nFound {len(files_to_extract)} file(s) to extract\n")
+
+        # Extract tables from each file
+        for filepath in files_to_extract:
+            print(f"Extracting from: {filepath.name}...")
+
+            df = self.table_extractor.extract_table(filepath)
+
+            if df is not None:
+                # Detect columns
+                column_map = self.table_extractor.detect_columns(df)
+                print(f"  Detected columns: {column_map}")
+
+                # Normalize table
+                normalized_df = self.table_extractor.normalize_table(df, column_map)
+
+                # Store extracted table
+                self.extracted_tables[filepath.name] = normalized_df
+
+                # Show info
+                info = self.table_extractor.get_table_info(normalized_df)
+                print(f"  ✓ Extracted {info['num_items_with_prices']} items with prices")
+            else:
+                print(f"  ✗ Failed to extract table")
+
+        print(f"\n✓ Extraction complete. {len(self.extracted_tables)} tables extracted.")
+        print("\nUse '/preview <filename>' to see table contents")
+        print("Use '/set-base <filename>' to set base file for comparison")
+
+    def cmd_preview_table(self, args: str):
+        """Preview extracted table.
+
+        Args:
+            args: Filename to preview
+        """
+        if not args.strip():
+            print("\nError: Please specify a filename")
+            print("Usage: /preview <filename>")
+            print(f"\nAvailable files: {list(self.extracted_tables.keys())}")
+            return
+
+        filename = args.strip()
+
+        if filename not in self.extracted_tables:
+            print(f"\nError: Table not extracted for: {filename}")
+            print(f"Available files: {list(self.extracted_tables.keys())}")
+            print("\nUse '/extract' to extract tables first")
+            return
+
+        df = self.extracted_tables[filename]
+        preview = self.table_extractor.preview_table(df, num_rows=10)
+
+        print(f"\n{filename}")
+        print(preview)
+
+    def cmd_set_base(self, args: str):
+        """Set base file for comparison.
+
+        Args:
+            args: Filename to use as base
+        """
+        if not args.strip():
+            print("\nError: Please specify a filename")
+            print("Usage: /set-base <filename>")
+            print(f"\nAvailable files: {list(self.extracted_tables.keys())}")
+            return
+
+        filename = args.strip()
+
+        if filename not in self.extracted_tables:
+            print(f"\nError: Table not extracted for: {filename}")
+            print("\nUse '/extract' to extract tables first")
+            return
+
+        self.base_file = filename
+        print(f"\n✓ Base file set to: {filename}")
+        print(f"  Items: {len(self.extracted_tables[filename])}")
+        print("\nNow use '/compare <file1> <file2> ...' to compare with other files")
+
+    def cmd_compare_tables(self, args: str):
+        """Compare base file with other files.
+
+        Args:
+            args: Space-separated list of filenames to compare
+        """
+        if not self.base_file:
+            print("\nError: No base file set")
+            print("Use '/set-base <filename>' first")
+            return
+
+        if not args.strip():
+            # Compare with all other extracted tables
+            comparison_files = [f for f in self.extracted_tables.keys() if f != self.base_file]
+        else:
+            # Compare with specified files
+            comparison_files = args.strip().split()
+
+        if not comparison_files:
+            print("\nError: No comparison files specified")
+            return
+
+        # Validate all files are extracted
+        for filename in comparison_files:
+            if filename not in self.extracted_tables:
+                print(f"\nError: Table not extracted for: {filename}")
+                print("\nUse '/extract' to extract tables first")
+                return
+
+        print("\n" + "="*60)
+        print("SEMANTIC TABLE COMPARISON")
+        print("="*60)
+
+        print(f"\nBase file: {self.base_file}")
+        print(f"  Items: {len(self.extracted_tables[self.base_file])}")
+        print(f"\nComparison files: {len(comparison_files)}")
+        for f in comparison_files:
+            print(f"  - {f} ({len(self.extracted_tables[f])} items)")
+
+        # Ensure chat is started
+        if not self.gemini_client.chat:
+            print("\nStarting chat session for semantic matching...")
+            self.gemini_client.start_chat()
+
+        # Perform semantic matching
+        base_df = self.extracted_tables[self.base_file]
+        base_items = base_df['item'].tolist()
+
+        match_results = {}
+
+        for comp_file in comparison_files:
+            print(f"\n{'='*60}")
+            print(f"Comparing with: {comp_file}")
+            print(f"{'='*60}")
+
+            comp_df = self.extracted_tables[comp_file]
+            comp_items = comp_df['item'].tolist()
+
+            # Batch match
+            results = self.semantic_matcher.batch_match(base_items, comp_items)
+            match_results[comp_file] = results
+
+            # Show statistics
+            stats = self.semantic_matcher.get_match_statistics(results)
+            print(f"\nMatch Statistics for {comp_file}:")
+            print(f"  Total items: {stats['total_items']}")
+            print(f"  Matched: {stats['matched']} ({stats['match_rate']:.1f}%)")
+            print(f"  High confidence: {stats['high_confidence']}")
+            print(f"  Medium confidence: {stats['medium_confidence']}")
+            print(f"  Low confidence: {stats['low_confidence']}")
+            print(f"  No match: {stats['no_match']}")
+
+        # Build comparison table
+        print(f"\n{'='*60}")
+        print("BUILDING COMPARISON TABLE")
+        print(f"{'='*60}\n")
+
+        comparison_data = {f: self.extracted_tables[f] for f in comparison_files}
+        comparison_df = self.comparison_generator.build_comparison_table(
+            base_df, comparison_data, match_results
+        )
+
+        # Add statistics
+        comparison_df = self.comparison_generator.add_statistics_row(comparison_df)
+
+        # Store for export
+        self.comparison_files = comparison_files
+        self.last_comparison = comparison_df
+
+        # Display summary
+        summary = self.comparison_generator.generate_summary_report(
+            base_df, comparison_data, match_results
+        )
+        print(summary)
+
+        print("\n✓ Comparison complete!")
+        print("Use '/export-comparison <filename>' to export results")
+
+    def cmd_export_comparison(self, args: str):
+        """Export comparison table to file.
+
+        Args:
+            args: Output filename (with .xlsx, .csv, or .md extension)
+        """
+        if not hasattr(self, 'last_comparison') or self.last_comparison is None:
+            print("\nError: No comparison results to export")
+            print("Run '/compare' first")
+            return
+
+        # Determine output filename
+        if args.strip():
+            filename = args.strip()
+        else:
+            # Auto-generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"comparison_{timestamp}.xlsx"
+
+        output_path = Path('exports') / filename
+
+        # Determine format from extension
+        suffix = output_path.suffix.lower()
+
+        if suffix == '.xlsx':
+            success = self.comparison_generator.export_excel(
+                self.last_comparison, output_path, add_formatting=True
+            )
+        elif suffix == '.csv':
+            success = self.comparison_generator.export_csv(
+                self.last_comparison, output_path
+            )
+        elif suffix == '.md':
+            success = self.comparison_generator.export_markdown(
+                self.last_comparison, output_path
+            )
+        else:
+            print(f"\nError: Unsupported format: {suffix}")
+            print("Supported formats: .xlsx, .csv, .md")
+            return
+
+        if success:
+            print(f"\n✓ Comparison exported successfully!")
+            print(f"  Location: {output_path}")
+        else:
+            print(f"\n✗ Export failed")
